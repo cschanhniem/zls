@@ -35,7 +35,50 @@ const selection_range = @import("features/selection_range.zig");
 const diagnostics_gen = @import("features/diagnostics.zig");
 
 const BuildOnSave = diagnostics_gen.BuildOnSave;
-const BuildOnSaveSupport = @compileError("TODO");
+
+pub const BuildOnSaveSupport = union(enum) {
+    supported,
+    invalid_linux_kernel_version: if (zig_builtin.os.tag == .linux) @FieldType(std.os.linux.utsname, "release") else noreturn,
+    unsupported_linux_kernel_version: if (zig_builtin.os.tag == .linux) std.SemanticVersion else noreturn,
+    unsupported_zig_version: if (@TypeOf(os_support) == std.SemanticVersion) void else noreturn,
+    unsupported_os: if (@TypeOf(os_support) == bool and !os_support) void else noreturn,
+
+    /// std.build.Watch requires `AT_HANDLE_FID` which is Linux 6.5+
+    /// https://github.com/ziglang/zig/issues/20720
+    pub const minimum_linux_version: std.SemanticVersion = .{ .major = 6, .minor = 5, .patch = 0 };
+
+    // We can't rely on `std.Build.Watch.have_impl` because we need to
+    // check the runtime Zig version instead of Zig version that ZLS
+    // has been built with.
+    pub const os_support = switch (zig_builtin.os.tag) {
+        .linux,
+        .windows,
+        .dragonfly,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .ios,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        .haiku,
+        => true,
+        else => false,
+    };
+
+    pub inline fn isSupportedComptime() bool {
+        if (!std.process.can_spawn) return false;
+        if (zig_builtin.single_threaded) return false;
+        return true;
+    }
+
+    pub fn isSupportedRuntime(runtime_zig_version: std.SemanticVersion) BuildOnSaveSupport {
+        comptime std.debug.assert(isSupportedComptime());
+        _ = runtime_zig_version;
+        return .supported;
+    }
+};
 
 const log = std.log.scoped(.server);
 

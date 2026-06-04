@@ -525,7 +525,8 @@ pub const BuildOnSave = struct {
             "build",
             "--zig-lib-dir",
             options.zig_lib_path,
-            "--watch",
+            "--listen=-",
+            "--maker-opt=Debug",
         };
         var argv: std.ArrayList([]const u8) = try .initCapacity(
             options.allocator,
@@ -534,7 +535,7 @@ pub const BuildOnSave = struct {
         defer argv.deinit(options.allocator);
 
         argv.appendSliceAssumeCapacity(base_args);
-        if (options.check_step_only) argv.appendAssumeCapacity("--check-only");
+        // if (options.check_step_only) argv.appendAssumeCapacity("--check-only");
         argv.appendSliceAssumeCapacity(options.build_on_save_args);
 
         var child_process = std.process.spawn(options.io, .{
@@ -632,13 +633,13 @@ pub const BuildOnSave = struct {
 
         var did_print_status = false;
         outer: while (true) {
-            while (stdout.bufferedLen() < @sizeOf(ServerToClient.Header)) {
+            while (stdout.bufferedLen() < @sizeOf(std.zig.Server.Message.Header)) {
                 multi_reader.fill(64, .none) catch |err| switch (err) {
                     error.Canceled, error.EndOfStream => break :outer,
                     else => break :outer log.err("failed to receive message from zig build-on-save runner: {}", .{err}),
                 };
             }
-            const header = stdout.takeStruct(ServerToClient.Header, .little) catch unreachable;
+            const header = stdout.takeStruct(std.zig.Server.Message.Header, .little) catch unreachable;
             while (stdout.bufferedLen() < header.bytes_len) {
                 multi_reader.fill(64, .none) catch |err| switch (err) {
                     error.Canceled => break :outer,
@@ -655,20 +656,25 @@ pub const BuildOnSave = struct {
                 log.info("Build-On-Save is running for '{s}'", .{workspace_path});
                 did_print_status = true;
             }
+            _ = body;
 
             switch (header.tag) {
-                .watch_error_bundle => {
-                    handleWatchErrorBundle(
-                        allocator,
-                        body,
-                        collection,
-                        workspace_path,
-                        &diagnostic_tags,
-                    ) catch |err| switch (err) {
-                        error.Canceled => break :outer,
-                        else => |e| log.err("failed to handle error bundle message from zig build-on-save runner: {}", .{e}),
-                    };
+                .zig_version => {},
+                .server_hello => {
+                    log.debug("TODO: handle .server_hello", .{});
                 },
+                // .watch_error_bundle => {
+                //     handleWatchErrorBundle(
+                //         allocator,
+                //         body,
+                //         collection,
+                //         workspace_path,
+                //         &diagnostic_tags,
+                //     ) catch |err| switch (err) {
+                //         error.Canceled => break :outer,
+                //         else => |e| log.err("failed to handle error bundle message from zig build-on-save runner: {}", .{e}),
+                //     };
+                // },
                 else => |tag| {
                     log.warn("received unexpected message from zig build-on-save runner: {}", .{tag});
                     break :outer;
@@ -690,54 +696,9 @@ pub const BuildOnSave = struct {
             return;
         };
 
-        const stderr_msg_prefix = if (stderr.bufferedLen() > 0) " and stderr:\n" else "";
-
-        switch (term) {
-            .exited => |code| if (code != 0) log.warn("zig build-on-save runner exited with with code: {d}{s}{s}", .{ code, stderr_msg_prefix, stderr.buffered() }),
-            .signal => |sig| std.log.err("zig build-on-save runner failed with signal {t}{s}{s}", .{ sig, stderr_msg_prefix, stderr.buffered() }),
-            .stopped => |sig| std.log.err("zig build-on-save runner stopped with signal {d}{s}{s}", .{ sig, stderr_msg_prefix, stderr.buffered() }),
-            .unknown => |code| std.log.err("zig build-on-save runner failed for unknown reason with code {d}{s}{s}", .{ code, stderr_msg_prefix, stderr.buffered() }),
+        if (!term.success()) {
+            const stderr_msg_prefix = if (stderr.bufferedLen() > 0) " and stderr:\n" else "";
+            log.err("zig build-on-save runner {t}{s}{s}", .{ term, stderr_msg_prefix, stderr.buffered() });
         }
-    }
-
-    fn handleWatchErrorBundle(
-        allocator: std.mem.Allocator,
-        body: []u8,
-        collection: *DiagnosticsCollection,
-        workspace_path: []const u8,
-        diagnostic_tags: *std.array_hash_map.Auto(DiagnosticsCollection.Tag, void),
-    ) (error{ OutOfMemory, InvalidMessage } || std.Io.File.Writer.Error)!void {
-        var reader: std.Io.Reader = .fixed(body);
-
-        const header = reader.takeStruct(ServerToClient.ErrorBundle, .little) catch return error.InvalidMessage;
-
-        const extra = reader.readSliceEndianAlloc(allocator, u32, header.extra_len, .little) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.EndOfStream => return error.InvalidMessage,
-            error.ReadFailed => unreachable,
-        };
-        defer allocator.free(extra);
-
-        const string_bytes = reader.readAlloc(allocator, header.string_bytes_len) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.EndOfStream => return error.InvalidMessage,
-            error.ReadFailed => unreachable,
-        };
-        defer allocator.free(string_bytes);
-
-        if (reader.bufferedLen() != 0) return error.InvalidMessage; // ensure that we read the entire body
-
-        const error_bundle: std.zig.ErrorBundle = .{ .string_bytes = string_bytes, .extra = extra };
-
-        var hasher: std.hash.Wyhash = .init(0);
-        hasher.update(workspace_path);
-        std.hash.autoHash(&hasher, header.step_id);
-
-        const diagnostic_tag: DiagnosticsCollection.Tag = @enumFromInt(@as(u32, @truncate(hasher.final())));
-
-        try diagnostic_tags.put(allocator, diagnostic_tag, {});
-
-        try collection.pushErrorBundle(diagnostic_tag, header.cycle, workspace_path, error_bundle);
-        try collection.publishDiagnostics();
     }
 };
