@@ -12,8 +12,6 @@ pub const BuildConfig = struct {
     modules: std.json.ArrayHashMap(Module),
     /// List of all compilations units.
     compilations: []const Compile,
-    /// The names of all top level steps.
-    top_level_steps: []const []const u8,
 
     pub const Module = struct {
         import_table: std.json.ArrayHashMap([]const u8),
@@ -80,8 +78,6 @@ pub fn loadBuildConfiguration(
         .out = &stdin_writer.interface,
     };
 
-    var got_errors = false;
-
     var maker: Maker = while (true) {
         const header = client.receiveMessage() catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
@@ -94,7 +90,6 @@ pub fn loadBuildConfiguration(
                 var error_bundle = try client.receiveErrorBundle(allocator);
                 defer error_bundle.deinit(allocator);
                 try diagnostics_collection.pushErrorBundle(diagnostic_tag, build_file_version, cwd_path, error_bundle);
-                got_errors = true;
                 continue;
             },
             .server_hello => break try .init(allocator, io, &client, cwd, zig_exe_path),
@@ -102,8 +97,9 @@ pub fn loadBuildConfiguration(
         }
         try client.in.discardAll(header.bytes_len);
     };
-    defer maker.deinit(allocator);
+    errdefer maker.arena.deinit();
 
+    const arena = maker.arena.allocator();
     const c = &maker.configuration;
 
     // The value tracks whether the step is a decendant of the default step step.
@@ -168,9 +164,9 @@ pub fn loadBuildConfiguration(
         var index: usize = 0;
         while (index < modules.count()) : (index += 1) {
             const mod = modules.keys()[index].get(c);
-            const import_table = mod.import_table.get(c).imports;
-            modules.ensureUnusedCapacity(allocator, import_table.mal.len) catch @panic("OOM");
-            for (import_table.mal.items(.module)) |other_mod| {
+            const import_table = mod.import_table.get(c).imports.mal;
+            modules.ensureUnusedCapacity(allocator, import_table.len) catch @panic("OOM");
+            for (import_table.items(.module)) |other_mod| {
                 modules.putAssumeCapacity(other_mod, {});
             }
         }
@@ -188,7 +184,7 @@ pub fn loadBuildConfiguration(
             }
         }
 
-        try client.serveBuildStepCompleted(needed_steps.keys());
+        try client.serveBuildSteps(needed_steps.keys());
 
         // receive `maker.generated_files` data
         while (true) {
@@ -201,8 +197,12 @@ pub fn loadBuildConfiguration(
                 .error_bundle => {
                     var error_bundle = try client.receiveErrorBundle(allocator);
                     defer error_bundle.deinit(allocator);
-                    try diagnostics_collection.pushErrorBundle(diagnostic_tag, build_file_version, cwd_path, error_bundle);
-                    got_errors = true;
+                    try diagnostics_collection.pushErrorBundle(
+                        diagnostic_tag,
+                        build_file_version,
+                        cwd_path,
+                        error_bundle,
+                    );
                     continue;
                 },
                 .build_started => {},
@@ -211,13 +211,33 @@ pub fn loadBuildConfiguration(
                 .build_step_completed => {
                     const body = try client.in.takeStruct(std.zig.Server.Message.BuildStepCompleted, .little);
 
-                    const extra = try client.in.readSliceEndianAlloc(allocator, u32, body.error_bundle.extra_len, .little);
-                    defer allocator.free(extra);
+                    const eb_extra = try client.in.readSliceEndianAlloc(allocator, u32, body.error_bundle.extra_len, .little);
+                    defer allocator.free(eb_extra);
 
-                    const string_bytes = try client.in.readAlloc(allocator, body.error_bundle.string_bytes_len);
+                    const eb_string_bytes = try client.in.readAlloc(allocator, body.error_bundle.string_bytes_len);
+                    defer allocator.free(eb_string_bytes);
+
+                    const error_bundle: std.zig.ErrorBundle = .{ .extra = eb_extra, .string_bytes = eb_string_bytes };
+
+                    const generated_file_index = try client.in.readSliceEndianAlloc(allocator, Configuration.GeneratedFileIndex, body.generated_file_count, .little);
+                    defer allocator.free(generated_file_index);
+
+                    const generated_file_base = try client.in.readSliceEndianAlloc(allocator, Configuration.Path.Base, body.generated_file_count, .little);
+                    defer allocator.free(generated_file_base);
+
+                    const generated_file_sub_path = try client.in.readSliceEndianAlloc(allocator, u32, body.generated_file_count, .little);
+                    defer allocator.free(generated_file_sub_path);
+
+                    const string_bytes = try client.in.readAlloc(allocator, body.string_bytes_len);
                     defer allocator.free(string_bytes);
 
-                    const error_bundle: std.zig.ErrorBundle = .{ .extra = extra, .string_bytes = string_bytes };
+                    for (generated_file_index, generated_file_base, generated_file_sub_path) |gf, base, sub_path| {
+                        const path: Configuration.Path.Unpacked = .{
+                            .base = base,
+                            .sub_path = try arena.dupe(u8, std.mem.sliceTo(string_bytes[sub_path..], 0)),
+                        };
+                        try maker.generated_files.put(arena, gf, path);
+                    }
 
                     try diagnostics_collection.pushErrorBundle(
                         diagnostic_tag,
@@ -232,76 +252,101 @@ pub fn loadBuildConfiguration(
             }
             try client.in.discardAll(header.bytes_len);
         }
-
-        // maker.resolveLazyPath()
     }
 
-    // // We collect modules in the following order:
-    // // - public modules (`std.Build.addModule`)
-    // // - modules that are reachable from the "install" step
-    // // - all other reachable modules
-    // var modules: std.array_hash_map.String(BuildConfig.Module) = .empty;
+    // We collect modules in the following order:
+    // - public modules (`std.Build.addModule`)
+    // - modules that are reachable from the "install" step
+    // - all other reachable modules
+    var resolved_modules: std.array_hash_map.String(BuildConfig.Module) = .empty;
 
-    // // for (b.modules.values()) |root_module| {
-    // //     const graph = root_module.getGraph();
-    // //     for (graph.modules) |module| {
-    // //         try helper.processModule(arena, &modules, module, null);
-    // //     }
-    // // }
-
-    // // We loop twice through all steps so that decendants of the "install" step are processed first.
-    // for ([_]bool{ true, false }) |want_install_step_decendant| {
-    //     for (all_steps.keys(), all_steps.values()) |step_index, is_install_step_decendant| {
-    //         if (is_install_step_decendant != want_install_step_decendant) continue;
-    //         const step = step_index.ptr(c);
-    //         const compile = step.extended.cast(c, Configuration.Step.Compile) orelse continue;
-    //         // compile.root_module.get(c)
-    //         const graph = compile.root_module.getGraph();
-    //         for (graph.modules) |module| {
-    //             try helper.processModule(arena, &modules, module, compile);
-    //         }
+    // for (b.modules.values()) |root_module| {
+    //     const graph = root_module.getGraph();
+    //     for (graph.modules) |module| {
+    //         try helper.processModule(arena, &modules, module);
     //     }
     // }
 
-    // var compilations: std.ArrayList(BuildConfig.Compile) = .empty;
-    // for (all_steps.keys()) |step| {
-    //     const compile = step.cast(Configuration.Step.Compile) orelse continue;
-    //     const root_source_file = compile.root_module.root_source_file orelse continue;
-    //     const root_source_file_path = try std.Io.Dir.path.resolve(arena, &.{ b.graph.cache.cwd, root_source_file.getPath2(compile.root_module.owner, null) });
-    //     try compilations.append(arena, .{
-    //         .root_module = root_source_file_path,
-    //     });
-    // }
+    var modules: std.array_hash_map.Auto(Configuration.Module.Index, void) = .empty;
+    defer modules.deinit(allocator);
 
-    if (got_errors) {
-        try diagnostics_collection.publishDiagnostics();
+    // We loop twice through all steps so that decendants of the "install" step are processed first.
+    for ([_]bool{ true, false }) |want_install_step_decendant| {
+        for (all_steps.keys(), all_steps.values()) |step_index, is_install_step_decendant| {
+            if (is_install_step_decendant != want_install_step_decendant) continue;
+            const step = step_index.ptr(c);
+            const compile = step.extended.cast(c, Configuration.Step.Compile) orelse continue;
+
+            var index = modules.count();
+            try modules.put(allocator, compile.root_module, {});
+            while (index < modules.count()) : (index += 1) {
+                const module = modules.keys()[index].get(c);
+                const import_table = module.import_table.get(c).imports.mal;
+
+                for (import_table.items(.module)) |import| try modules.put(allocator, import, {});
+
+                const root_source_file = module.root_source_file.unwrap() orelse continue;
+                const root_source_file_path = try maker.resolveLazyPath(arena, root_source_file.get(c)) orelse continue;
+
+                // All modules with the same root source file are merged. This limitation may be lifted in the future.
+                const gop = try resolved_modules.getOrPutValue(arena, root_source_file_path, .{
+                    .import_table = .{},
+                });
+
+                for (import_table.items(.name), import_table.items(.module)) |name, import_module| {
+                    const import_root_source_file = import_module.get(c).root_source_file.unwrap() orelse continue;
+                    const import_root_source_file_path = try maker.resolveLazyPath(arena, import_root_source_file.get(c)) orelse continue;
+
+                    const gop_import = try gop.value_ptr.import_table.map.getOrPut(arena, name.slice(c));
+                    // This does not account for the possibility of collisions (i.e. modules with same root source file import different modules under the same name).
+                    if (!gop_import.found_existing) {
+                        gop_import.value_ptr.* = import_root_source_file_path;
+                    }
+                }
+            }
+        }
     }
+
+    var compilations: std.ArrayList(BuildConfig.Compile) = .empty;
+    for (all_steps.keys()) |step_index| {
+        const step = step_index.ptr(c);
+        const compile = step.extended.cast(c, Configuration.Step.Compile) orelse continue;
+        const root_module = compile.root_module.get(c);
+        const root_source_file = root_module.root_source_file.unwrap() orelse continue;
+        const root_source_file_path = try maker.resolveLazyPath(arena, root_source_file.get(c)) orelse continue;
+        try compilations.append(arena, .{
+            .root_module = root_source_file_path,
+        });
+    }
+
+    try diagnostics_collection.publishDiagnostics();
 
     try client.serveMessageHeader(.{ .tag = .exit, .bytes_len = 0 });
     try client.out.flush();
 
     const term = try child.wait(io);
 
-    if (got_errors or !term.success()) {
+    if (!term.success()) {
         const joined = try std.mem.join(allocator, " ", argv);
         defer allocator.free(joined);
         std.log.err("Failed to collect build system configuration, command:\ncd {f};{s}", .{ cwd, joined });
         return error.RunFailed;
-    } else {
-        std.debug.print("collected build system configuration\n", .{});
     }
 
+    const build_config: BuildConfig = .{
+        .dependencies = .{ .map = .empty },
+        .modules = .{ .map = resolved_modules },
+        .compilations = compilations.items,
+    };
+
+    // std.debug.print("collected build system configuration:\n{f}\n", .{std.json.fmt(build_config, .{ .whitespace = .indent_2 })});
+
     const arena_allocator = try allocator.create(std.heap.ArenaAllocator);
-    arena_allocator.* = .init(allocator);
+    arena_allocator.* = maker.arena;
 
     return .{
         .arena = arena_allocator,
-        .value = .{
-            .dependencies = .{ .map = .empty },
-            .modules = .{ .map = .empty },
-            .compilations = &.{},
-            .top_level_steps = &.{},
-        },
+        .value = build_config,
     };
 }
 
@@ -330,14 +375,38 @@ const Maker = struct {
         const configuration_file_path = try client.in.readAlloc(allocator, header.configuration_file_path_len);
         defer allocator.free(configuration_file_path);
 
-        const global_cache_path = try client.in.readAlloc(arena, header.base_paths.global_cache_path_len);
-        const local_cache_path = try client.in.readAlloc(arena, header.base_paths.local_cache_path_len);
-        const zig_lib_path = try client.in.readAlloc(arena, header.base_paths.zig_lib_path_len);
-        const build_root_path = try client.in.readAlloc(arena, header.base_paths.build_root_path_len);
-        const install_prefix_path = try client.in.readAlloc(arena, header.base_paths.install_prefix_path_len);
-        const install_lib_path = try client.in.readAlloc(arena, header.base_paths.install_lib_path_len);
-        const install_bin_path = try client.in.readAlloc(arena, header.base_paths.install_bin_path_len);
-        const install_include_path = try client.in.readAlloc(arena, header.base_paths.install_include_path_len);
+        const global_cache_cwd_path = try client.in.readAlloc(allocator, header.base_paths.global_cache_path_len);
+        defer allocator.free(global_cache_cwd_path);
+
+        const local_cache_cwd_path = try client.in.readAlloc(allocator, header.base_paths.local_cache_path_len);
+        defer allocator.free(local_cache_cwd_path);
+
+        const zig_lib_cwd_path = try client.in.readAlloc(allocator, header.base_paths.zig_lib_path_len);
+        defer allocator.free(zig_lib_cwd_path);
+
+        const build_root_cwd_path = try client.in.readAlloc(allocator, header.base_paths.build_root_path_len);
+        defer allocator.free(build_root_cwd_path);
+
+        const install_prefix_cwd_path = try client.in.readAlloc(allocator, header.base_paths.install_prefix_path_len);
+        defer allocator.free(install_prefix_cwd_path);
+
+        const install_lib_cwd_path = try client.in.readAlloc(allocator, header.base_paths.install_lib_path_len);
+        defer allocator.free(install_lib_cwd_path);
+
+        const install_bin_cwd_path = try client.in.readAlloc(allocator, header.base_paths.install_bin_path_len);
+        defer allocator.free(install_bin_cwd_path);
+
+        const install_include_cwd_path = try client.in.readAlloc(allocator, header.base_paths.install_include_path_len);
+        defer allocator.free(install_include_cwd_path);
+
+        const global_cache_path = try Dir.path.resolve(arena, &.{ cwd.path.?, global_cache_cwd_path });
+        const local_cache_path = try Dir.path.resolve(arena, &.{ cwd.path.?, local_cache_cwd_path });
+        const zig_lib_path = try Dir.path.resolve(arena, &.{ cwd.path.?, zig_lib_cwd_path });
+        const build_root_path = try Dir.path.resolve(arena, &.{ cwd.path.?, build_root_cwd_path });
+        const install_prefix_path = try Dir.path.resolve(arena, &.{ cwd.path.?, install_prefix_cwd_path });
+        const install_lib_path = try Dir.path.resolve(arena, &.{ cwd.path.?, install_lib_cwd_path });
+        const install_bin_path = try Dir.path.resolve(arena, &.{ cwd.path.?, install_bin_cwd_path });
+        const install_include_path = try Dir.path.resolve(arena, &.{ cwd.path.?, install_include_cwd_path });
 
         const configuration_file = cwd.handle.openFile(io, configuration_file_path, .{}) catch |err| {
             std.log.err("failed to open configuration file {s}: {t}", .{ configuration_file_path, err });
@@ -358,7 +427,7 @@ const Maker = struct {
         }
 
         return .{
-            .arena = arena_allocator.state,
+            .arena = arena_allocator,
             .configuration = configuration,
             .top_level_steps = top_level_steps,
             .cwd = cwd.path orelse ".",
@@ -376,11 +445,7 @@ const Maker = struct {
         };
     }
 
-    fn deinit(config: *Maker, allocator: std.mem.Allocator) void {
-        config.arena.promote(allocator).deinit();
-    }
-
-    arena: std.heap.ArenaAllocator.State,
+    arena: std.heap.ArenaAllocator,
     configuration: Configuration,
     top_level_steps: std.array_hash_map.String(Configuration.Step.Index),
 
@@ -392,7 +457,7 @@ const Maker = struct {
     build_root_directory: []const u8,
     install_paths: InstallPaths,
 
-    generated_files: std.array_hash_map.Auto(Configuration.GeneratedFileIndex, Path) = .empty,
+    generated_files: std.array_hash_map.Auto(Configuration.GeneratedFileIndex, Configuration.Path.Unpacked) = .empty,
 
     const InstallPaths = struct {
         prefix: []const u8,
@@ -405,21 +470,21 @@ const Maker = struct {
         maker: *const Maker,
         arena: Allocator,
         lazy_path: Configuration.LazyPath,
-    ) Allocator.Error!?Path {
-        const c = &maker.scanned_config.configuration;
+    ) Allocator.Error!?[]const u8 {
+        const c = &maker.configuration;
         return switch (lazy_path) {
             .source_path => |sp| try packagePath(maker, arena, sp.owner, sp.sub_path.slice(c)),
-            .relative => |relative| relativePath(maker, arena, relative),
+            .relative => |relative| try relativePath(maker, arena, relative.unwrap(c)),
             .generated => |gen| {
                 const base = maker.generated_files.get(gen.index) orelse return null;
-                var file_path = base;
+                var file_path = base.sub_path;
                 for (0..gen.flags.up) |_| {
-                    file_path.sub_path = Dir.path.dirname(file_path.sub_path) orelse {
-                        std.log.err(maker, "invalid LazyPath traversal: up {d} times from {f}", .{ gen.flags.up, base });
+                    file_path = Dir.path.dirname(file_path) orelse {
+                        std.log.err("invalid LazyPath traversal: up {d} times from {s}", .{ gen.flags.up, base.sub_path });
                         return null;
                     };
                 }
-                return file_path.join(arena, gen.sub_path.slice(c));
+                return try Dir.path.join(arena, &.{ maker.basePath(base.base), file_path, gen.sub_path.slice(c) });
             },
         };
     }
@@ -429,34 +494,35 @@ const Maker = struct {
         arena: Allocator,
         package_index: Configuration.Package.Index,
         sub_path: []const u8,
-    ) Allocator.Error!Path {
-        const c = &maker.scanned_config.configuration;
-        const package = package_index.get(c) orelse return maker.build_root_directory.join(arena, &.{sub_path});
-        return try Dir.path.join(arena, &.{ maker.cwd, package.root_path.slice(c), sub_path });
+    ) Allocator.Error![]const u8 {
+        const c = &maker.configuration;
+        const package = package_index.get(c) orelse return try Dir.path.join(arena, &.{ maker.build_root_directory, sub_path });
+        return try Dir.path.resolve(arena, &.{ maker.cwd, package.root_path.slice(c), sub_path });
     }
 
     fn relativePath(
         maker: *const Maker,
         arena: Allocator,
-        relative: Configuration.LazyPath.Relative,
-    ) Allocator.Error!Path {
-        const c = &maker.scanned_config.configuration;
-        const sub_path = relative.sub_path.slice(c);
+        relative: Configuration.Path.Unpacked,
+    ) Allocator.Error![]const u8 {
+        const sub_path = relative.sub_path;
+        const base_path = maker.basePath(relative.base);
+        if (sub_path.len == 0) return base_path;
+        return try Dir.path.join(arena, &.{ base_path, sub_path });
+    }
 
-        return switch (relative.flags.base) {
-            .cwd => Dir.path.join(arena, &.{ maker.cwd, sub_path }),
-            .zig_exe => {
-                if (sub_path.len == 0) return maker.zig_exe;
-                return try Dir.path.join(arena, &.{ maker.zig_exe, sub_path });
-            },
-            .local_cache => maker.local_cache_root.join(arena, &.{sub_path}),
-            .global_cache => maker.global_cache_root.join(arena, &.{sub_path}),
-            .build_root => maker.build_root_directory.join(arena, &.{sub_path}),
-            .zig_lib => maker.zig_lib_directory.join(arena, &.{sub_path}),
-            .install_prefix => try maker.install_paths.prefix.join(arena, sub_path),
-            .install_lib => try maker.install_paths.lib.join(arena, sub_path),
-            .install_bin => try maker.install_paths.bin.join(arena, sub_path),
-            .install_include => try maker.install_paths.include.join(arena, sub_path),
+    fn basePath(maker: *const Maker, base: Configuration.Path.Base) []const u8 {
+        return switch (base) {
+            .cwd => maker.cwd,
+            .zig_exe => maker.zig_exe,
+            .local_cache => maker.local_cache_root,
+            .global_cache => maker.global_cache_root,
+            .build_root => maker.build_root_directory,
+            .zig_lib => maker.zig_lib_directory,
+            .install_prefix => maker.install_paths.prefix,
+            .install_lib => maker.install_paths.lib,
+            .install_bin => maker.install_paths.bin,
+            .install_include => maker.install_paths.include,
         };
     }
 };
