@@ -68,9 +68,9 @@ pub fn build(b: *Build) !void {
         const test_options = b.addOptions();
         test_options.step.name = "ZLS test options";
 
-        test_options.addOptionPath("zig_exe_path", .{ .cwd_relative = b.graph.zig_exe });
-        test_options.addOptionPath("zig_lib_path", .{ .cwd_relative = b.fmt("{f}", .{b.graph.zig_lib_directory}) });
-        test_options.addOptionPath("global_cache_path", .{ .cwd_relative = b.cache_root.join(b.allocator, &.{"zls"}) catch @panic("OOM") });
+        test_options.addOptionPath("zig_exe_path", .zig_exe);
+        test_options.addOptionPath("zig_lib_path", .zig_lib);
+        test_options.addOptionPath("global_cache_path", std.Build.LazyPath.cache_root.join(b.allocator, "zls") catch @panic("OOM"));
 
         break :blk test_options.createModule();
     };
@@ -118,18 +118,15 @@ pub fn build(b: *Build) !void {
     { // zig build gen
         const gen_step = b.step("gen", "Regenerate config files");
 
+        const update_source = b.addUpdateSourceFiles();
+        gen_step.dependOn(&update_source.step);
+
         const gen_cmd = b.addRunArtifact(gen_exe);
-        if (b.args) |args| {
-            gen_cmd.addArgs(args);
-            gen_step.dependOn(&gen_cmd.step);
-        } else {
-            const update_source = b.addUpdateSourceFiles();
-            gen_cmd.addArg("--generate-config");
-            update_source.addCopyFileToSource(gen_cmd.addOutputFileArg("Config.zig"), "src/Config.zig");
-            gen_cmd.addArg("--generate-schema");
-            update_source.addCopyFileToSource(gen_cmd.addOutputFileArg("schema.json"), "schema.json");
-            gen_step.dependOn(&update_source.step);
-        }
+        gen_cmd.addArg("--generate-config");
+        update_source.addCopyFileToSource(gen_cmd.addOutputFileArg("Config.zig"), "src/Config.zig");
+        gen_cmd.addArg("--generate-schema");
+        update_source.addCopyFileToSource(gen_cmd.addOutputFileArg("schema.json"), "schema.json");
+        gen_cmd.addPassthruArgs();
     }
 
     { // zig build release
@@ -255,20 +252,6 @@ pub fn build(b: *Build) !void {
         .use_lld = use_llvm,
     });
 
-    if (target.result.cpu.arch.isWasm() and b.enable_wasmtime) {
-        // Zig's build system integration with wasmtime does not support adding custom preopen directories so it is done manually.
-        const args: []const ?[]const u8 = &.{
-            "wasmtime",
-            "--dir=.",
-            b.fmt("--dir={f}::/lib", .{b.graph.zig_lib_directory}),
-            b.fmt("--dir={s}::/cache", .{b.cache_root.join(b.allocator, &.{"zls"}) catch @panic("OOM")}),
-            "--",
-            null,
-        };
-        tests.setExecCmd(args);
-        src_tests.setExecCmd(args);
-    }
-
     blk: { // zig build test, zig build test-build-runner, zig build test-analysis
         const test_step = b.step("test", "Run all the tests");
         const test_build_runner_step = b.step("test-build-runner", "Run all the build runner tests");
@@ -281,8 +264,10 @@ pub fn build(b: *Build) !void {
         const run_tests = b.addRunArtifact(tests);
         const run_src_tests = b.addRunArtifact(src_tests);
 
-        run_tests.skip_foreign_checks = target.result.cpu.arch.isWasm() and b.enable_wasmtime;
-        run_src_tests.skip_foreign_checks = target.result.cpu.arch.isWasm() and b.enable_wasmtime;
+        for ([_]*Build.Step.Run{ run_tests, run_src_tests }) |run| {
+            run.setPreopen("/lib", .zig_lib);
+            run.setPreopen("/cache", Build.LazyPath.cache_root.join(b.allocator, "zls") catch @panic("OOM"));
+        }
 
         // Setup dependencies of `zig build test`
         test_step.dependOn(&run_tests.step);
@@ -303,10 +288,11 @@ pub fn build(b: *Build) !void {
             run_test_steps.append(b.allocator, step.cast(std.Build.Step.Run).?) catch @panic("OOM");
         }
 
-        const kcov_bin = b.findProgram(&.{"kcov"}, &.{}) catch "kcov";
+        const kcov_bin = b.findProgramLazy(.{ .names = &.{"kcov"} });
 
         const merge_step = std.Build.Step.Run.create(b, "merge coverage");
-        merge_step.addArgs(&.{ kcov_bin, "--merge" });
+        merge_step.addFileArg(kcov_bin);
+        merge_step.addArg("--merge");
         merge_step.rename_step_with_output_arg = false;
         const merged_coverage_output = merge_step.addOutputFileArg(".");
 
@@ -315,7 +301,8 @@ pub fn build(b: *Build) !void {
 
             // prepend the kcov exec args
             const argv = run_step.argv.toOwnedSlice(b.allocator) catch @panic("OOM");
-            run_step.addArgs(&.{ kcov_bin, "--collect-only" });
+            merge_step.addFileArg(kcov_bin);
+            merge_step.addArg("--collect-only");
             run_step.addPrefixedDirectoryArg("--include-pattern=", b.path("src"));
             merge_step.addDirectoryArg(run_step.addOutputFileArg(run_step.producer.?.name));
             run_step.argv.appendSlice(b.allocator, argv) catch @panic("OOM");
@@ -341,8 +328,12 @@ fn getVersion(b: *Build) std.SemanticVersion {
 
     if (zls_version.pre == null) return zls_version;
 
+    // Ensure git version changes get picked up
+    // https://codeberg.org/ziglang/zig/issues/35473
+    b.graph.poisonCache();
+
     const argv: []const []const u8 = &.{
-        "git", "-C", b.pathFromRoot("."), "--git-dir", ".git", "describe", "--match", "*.*.*", "--tags",
+        "git", "-C", b.fmt("{f}", .{b.root}), "--git-dir", ".git", "describe", "--match", "*.*.*", "--tags",
     };
     var code: u8 = undefined;
     const git_describe_untrimmed = b.runAllowFail(argv, &code, .ignore) catch |err| {
@@ -488,7 +479,7 @@ fn release(b: *Build, release_artifacts: []const *Build.Step.Compile, released_z
     const release_minisign = b.option(bool, "release-minisign", "Sign release artifacts with Minisign") orelse false;
 
     if (released_zls_version.pre != null and released_zls_version.build == null) {
-        release_step.addError("Cannot build release because the ZLS version could not be resolved", .{}) catch @panic("OOM");
+        release_step.dependOn(&b.addFail("Cannot build release because the ZLS version could not be resolved").step);
         return;
     }
 
@@ -568,7 +559,7 @@ fn release(b: *Build, release_artifacts: []const *Build.Step.Compile, released_z
             const minising_cmd = b.addSystemCommand(&.{ "minisign", "-Sm" });
             minising_cmd.clearEnvironment();
             minising_cmd.addFileArg(file_path);
-            minising_cmd.addPrefixedFileArg("-s", .{ .cwd_relative = "minisign.key" });
+            minising_cmd.addPrefixedFileArg("-s", b.graph.cwdRelativePath("minisign.key"));
             const minising_file_path = minising_cmd.addPrefixedOutputFileArg("-x", minisign_basename);
 
             const install_minising = b.addInstallFileWithDir(minising_file_path, install_dir, minisign_basename);
