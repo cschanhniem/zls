@@ -9,11 +9,12 @@ const log = std.log.scoped(.store);
 const lsp = @import("lsp");
 const Ast = std.zig.Ast;
 const BuildAssociatedConfig = @import("BuildAssociatedConfig.zig");
-pub const BuildConfig = @import("build_runner/shared.zig").BuildConfig;
 const tracy = @import("tracy");
 const DocumentScope = @import("DocumentScope.zig");
 const DiagnosticsCollection = @import("DiagnosticsCollection.zig");
 const TrigramStore = @import("TrigramStore.zig");
+
+const BuildConfig = @compileError("TODO");
 
 const DocumentStore = @This();
 
@@ -40,7 +41,6 @@ pub const Config = struct {
     environ_map: *const std.process.Environ.Map,
     zig_exe_path: ?[]const u8,
     zig_lib_dir: ?std.Build.Cache.Directory,
-    build_runner_path: ?[]const u8,
     builtin_path: ?[]const u8,
     global_cache_dir: ?std.Build.Cache.Directory,
     wasi_preopens: switch (builtin.os.tag) {
@@ -916,7 +916,6 @@ pub fn invalidateBuildFile(self: *DocumentStore, build_file_uri: Uri) void {
     comptime std.debug.assert(supports_build_system);
 
     if (self.config.zig_exe_path == null) return;
-    if (self.config.build_runner_path == null) return;
     if (self.config.global_cache_dir == null) return;
     if (self.config.zig_lib_dir == null) return;
 
@@ -1287,8 +1286,6 @@ fn prepareBuildRunnerArgs(self: *DocumentStore, build_file_uri: Uri) error{OutOf
     const base_args = &[_][]const u8{
         self.config.zig_exe_path.?,
         "build",
-        "--build-runner",
-        self.config.build_runner_path.?,
         "--zig-lib-dir",
         self.config.zig_lib_dir.?.path orelse ".",
     };
@@ -1322,7 +1319,6 @@ fn loadBuildConfiguration(self: *DocumentStore, build_file_uri: Uri, build_file_
     defer tracy_zone.end();
 
     std.debug.assert(self.config.zig_exe_path != null);
-    std.debug.assert(self.config.build_runner_path != null);
     std.debug.assert(self.config.global_cache_dir != null);
     std.debug.assert(self.config.zig_lib_dir != null);
 

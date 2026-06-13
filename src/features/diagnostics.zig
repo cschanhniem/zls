@@ -502,9 +502,6 @@ pub const BuildOnSave = struct {
     worker: std.Io.Future(void),
     worker_state: *WorkerState,
 
-    const shared = @import("../build_runner/shared.zig");
-    const ServerToClient = shared.ServerToClient;
-
     const WorkerState = struct {
         mutex: std.Io.Mutex,
         child_process: std.process.Child,
@@ -518,7 +515,6 @@ pub const BuildOnSave = struct {
         check_step_only: bool,
         zig_exe_path: []const u8,
         zig_lib_path: []const u8,
-        build_runner_path: []const u8,
 
         collection: *DiagnosticsCollection,
     };
@@ -527,8 +523,6 @@ pub const BuildOnSave = struct {
         const base_args: []const []const u8 = &.{
             options.zig_exe_path,
             "build",
-            "--build-runner",
-            options.build_runner_path,
             "--zig-lib-dir",
             options.zig_lib_path,
             "--watch",

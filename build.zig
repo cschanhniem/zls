@@ -7,8 +7,6 @@ const minimum_build_zig_version = @import("build.zig.zon").minimum_zig_version;
 
 /// Specify the minimum Zig version that is usable with ZLS:
 /// `std.builtin` -> `std.lang` migration progress
-///
-/// A breaking change to the Zig Build System should be handled by updating ZLS's build runner (see src\build_runner)
 const minimum_runtime_zig_version = "0.17.0-dev.274+7eb79daff";
 
 const release_targets = [_]std.Target.Query{
@@ -254,11 +252,9 @@ pub fn build(b: *Build) !void {
 
     blk: { // zig build test, zig build test-build-runner, zig build test-analysis
         const test_step = b.step("test", "Run all the tests");
-        const test_build_runner_step = b.step("test-build-runner", "Run all the build runner tests");
         const test_analysis_step = b.step("test-analysis", "Run all the analysis tests");
 
         // Create run steps
-        @import("tests/add_build_runner_cases.zig").addCases(b, test_build_runner_step, test_filters);
         @import("tests/add_analysis_cases.zig").addCases(b, target, optimize, test_analysis_step, test_filters);
 
         const run_tests = b.addRunArtifact(tests);
@@ -273,7 +269,6 @@ pub fn build(b: *Build) !void {
         test_step.dependOn(&run_tests.step);
         test_step.dependOn(&run_src_tests.step);
         test_step.dependOn(test_analysis_step);
-        if (target.query.eql(b.graph.host.query)) test_step.dependOn(test_build_runner_step);
 
         if (!coverage) break :blk;
 
@@ -281,9 +276,6 @@ pub fn build(b: *Build) !void {
         var run_test_steps: std.ArrayList(*std.Build.Step.Run) = .empty;
         run_test_steps.append(b.allocator, run_tests) catch @panic("OOM");
         run_test_steps.append(b.allocator, run_src_tests) catch @panic("OOM");
-        for (test_build_runner_step.dependencies.items) |step| {
-            run_test_steps.append(b.allocator, step.cast(std.Build.Step.Run).?) catch @panic("OOM");
-        }
         for (test_analysis_step.dependencies.items) |step| {
             run_test_steps.append(b.allocator, step.cast(std.Build.Step.Run).?) catch @panic("OOM");
         }
