@@ -404,21 +404,6 @@ fn loadConfiguration(
         }
     }
 
-    if (config.global_cache_path == null) blk: {
-        if (zig_builtin.target.os.tag == .wasi) {
-            // will default to `/cache`
-            break :blk;
-        }
-
-        const cache_dir_path = try known_folders.getPath(io, allocator, environ_map, .cache) orelse {
-            server.showMessage(.Error, "Failed to resolve global cache directory", .{});
-            break :blk;
-        };
-        defer allocator.free(cache_dir_path);
-
-        config.global_cache_path = try std.Io.Dir.path.join(config_arena.allocator(), &.{ cache_dir_path, "zls" });
-    }
-
     try server.config_manager.setConfiguration2(.frontend, &config);
 }
 

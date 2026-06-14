@@ -139,7 +139,6 @@ pub const Manager = struct {
 
         var config: Config = .{
             .zig_lib_path = if (builtin.os.tag == .wasi) "/lib" else null,
-            .global_cache_path = if (builtin.os.tag == .wasi) "/cache" else null,
         };
         for (manager.impl.configs.values) |unresolved_config| {
             inline for (comptime std.meta.fieldNames(UnresolvedConfig)) |field_name| {
@@ -207,45 +206,37 @@ pub const Manager = struct {
             }
         }
 
-        for (
-            [_]*?[]const u8{ &config.zig_lib_path, &config.global_cache_path },
-            [_]*?std.Build.Cache.Directory{ &manager.zig_lib_dir, &manager.global_cache_dir },
-            [_]enum { open, create }{ .open, .create },
-            [_][]const u8{ "zig library", "global cache" },
-        ) |opt_path, result_dir, action, name| {
-            const path = opt_path.* orelse continue;
+        blk: {
+            const zig_lib_path = config.zig_lib_path orelse break :blk;
             if (builtin.target.os.tag == .wasi) {
                 // TODO The path could be a subdirectory of a preopen directory
-                const resource = manager.wasi_preopens.get(path) orelse {
-                    log.warn("failed to resolve '{s}' WASI preopen", .{path});
-                    opt_path.* = null;
-                    continue;
+                const resource = manager.wasi_preopens.get(zig_lib_path) orelse {
+                    log.warn("failed to resolve '{s}' WASI preopen", .{zig_lib_path});
+                    config.zig_lib_path = null;
+                    break :blk;
                 };
                 switch (resource) {
                     .dir => |dir| {
-                        result_dir.* = .{ .handle = dir, .path = path };
-                        continue;
+                        manager.zig_lib_dir = .{ .handle = dir, .path = zig_lib_path };
+                        break :blk;
                     },
                     .file => {
-                        log.err("failed to resolve {s} directory '{s}': {}", .{ name, path, std.Io.File.OpenError.NotDir });
-                        opt_path.* = null;
-                        continue;
+                        log.err("failed to resolve zig library directory '{s}': {}", .{ zig_lib_path, std.Io.File.OpenError.NotDir });
+                        config.zig_lib_path = null;
+                        break :blk;
                     },
                 }
             } else {
-                const dir = switch (action) {
-                    .open => std.Io.Dir.cwd().openDir(io, path, .{}),
-                    .create => std.Io.Dir.cwd().createDirPathOpen(io, path, .{}),
-                } catch |err| switch (err) {
+                const dir = std.Io.Dir.cwd().openDir(io, zig_lib_path, .{}) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
                     else => {
-                        log.err("failed to open {s} directory '{s}': {}", .{ name, path, err });
-                        opt_path.* = null;
-                        continue;
+                        log.err("failed to open zig library directory '{s}': {}", .{ zig_lib_path, err });
+                        config.zig_lib_path = null;
+                        break :blk;
                     },
                 };
-                result_dir.* = .{ .handle = dir, .path = path };
-                continue;
+                manager.zig_lib_dir = .{ .handle = dir, .path = zig_lib_path };
+                break :blk;
             }
             comptime unreachable;
         }
@@ -605,7 +596,6 @@ pub const file_system_config_options: []const FileConfigInfo = &.{
     .{ .name = "zig_exe_path", .kind = .file, .is_accessible = true },
     .{ .name = "builtin_path", .kind = .file, .is_accessible = true },
     .{ .name = "zig_lib_path", .kind = .directory, .is_accessible = true },
-    .{ .name = "global_cache_path", .kind = .directory, .is_accessible = false },
 };
 
 comptime {

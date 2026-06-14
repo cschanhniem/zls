@@ -116,11 +116,6 @@
             "description": "Specify the path to the Zig executable (not the directory). If unset, zig is looked up in `PATH`. e.g. `/path/to/zig-templeos-armless-1.0.0/zig`.",
             "type": "string",
             "default": null
-        },
-        "global_cache_path": {
-            "description": "Path to a directory that will be used as zig's cache. Will default to `${KnownFolders.Cache}/zls`.",
-            "type": "string",
-            "default": null
         }
     }
 }

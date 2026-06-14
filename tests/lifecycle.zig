@@ -22,7 +22,6 @@ test "LSP lifecycle" {
         try config_manager.setConfiguration(.frontend, &.{
             .zig_exe_path = try std.Io.Dir.path.resolve(arena, &.{ cwd, test_options.zig_exe_path }),
             .zig_lib_path = try std.Io.Dir.path.resolve(arena, &.{ cwd, test_options.zig_lib_path }),
-            .global_cache_path = try std.Io.Dir.path.resolve(arena, &.{ cwd, test_options.global_cache_path }),
         });
     }
 
