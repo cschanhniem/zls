@@ -132,6 +132,7 @@ const excluded_builtins_set: std.EnumArray(std.zig.BuiltinFn.Tag, bool) = .init(
     .Struct = false,
     .Union = false,
     .Enum = false,
+    .SpirvType = true,
     .type_info = true,
     .type_name = true,
     .TypeOf = true, // variadic
